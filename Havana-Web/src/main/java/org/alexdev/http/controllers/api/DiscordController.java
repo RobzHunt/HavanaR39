@@ -98,8 +98,9 @@ public class DiscordController {
         } else {
             var uid = webConnection.session().getInt("user.id");
             PlayerDao.setDiscordId(uid, discordId);
+            SessionDao.saveTrade(uid, true);                                        // salva no banco primeiro
+            RconUtil.sendCommand(RconHeader.REFRESH_TRADE_SETTING, new HashMap<>()); // depois notifica o servidor
             webConnection.session().set("discord.saved.alert", true);
-            RconUtil.sendCommand(RconHeader.REFRESH_TRADE_SETTING, new HashMap<>());
         }
 
         webConnection.redirect("/");
