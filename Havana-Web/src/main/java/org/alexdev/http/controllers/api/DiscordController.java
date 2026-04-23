@@ -25,94 +25,123 @@ import org.alexdev.http.util.SessionUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class DiscordController {
+
+    private static final String TOKEN_URL = "https://discord.com/api/oauth2/token";
+    private static final String USER_URL  = "https://discordapp.com/api/users/@me";
+
     public static void verify(WebConnection webConnection) {
         var code = webConnection.get().getString("code");
 
         try {
-            var data = 
-                "client_id=" + URLEncoder.encode("CHANGE ME", "UTF-8") + "&" +
-                "client_secret=" + URLEncoder.encode("CHANGE ME", "UTF-8") + "&" +
-                "grant_type=" + URLEncoder.encode("authorization_code", "UTF-8") + "&" +
-                "code=" + URLEncoder.encode(code, "UTF-8") + "&" +
-                "redirect_uri=" + URLEncoder.encode(GameConfiguration.getInstance().getString("site.path") + "/api/discord", "UTF-8") + "&" +
-                "scope=" + URLEncoder.encode("identify", "UTF-8");
+            var accessToken = fetchAccessToken(code);
+            var discordId   = fetchDiscordId(accessToken);
 
-            var url = new URL("https://discord.com/api/oauth2/token");
-            var connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("POST");
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            connection.setRequestProperty("Content-Length", Integer.toString(data.length()));
-            connection.setDoOutput(true);
+            handleVerification(webConnection, discordId);
 
-            var wr = new DataOutputStream(connection.getOutputStream());
-            wr.writeBytes(data);
-            wr.flush();
-            wr.close();
-
-            // Read the response
-            var responseCode = connection.getResponseCode();
-            var in = new BufferedReader(new InputStreamReader(connection.getInputStream()));
-            String inputLine;
-            var response = new StringBuffer();
-            while ((inputLine = in.readLine()) != null) {
-                response.append(inputLine);
-            }
-            in.close();
-
-            webConnection.send(response.toString());
-
-            var mapper = new ObjectMapper();
-            var token = mapper.readTree(response.toString()).get("access_token").asText();
-
-            var url2 = new URL("https://discordapp.com/api/users/@me");
-            var connection2 = (HttpURLConnection) url2.openConnection();
-            connection2.setRequestProperty("Authorization", "Bearer " + token);
-
-            int responseCode2 = connection2.getResponseCode();
-
-            var in2 = new BufferedReader(new InputStreamReader(connection2.getInputStream()));
-            String inputLine2;
-            StringBuffer response2 = new StringBuffer();
-
-            while ((inputLine2 = in2.readLine()) != null) {
-                response2.append(inputLine2);
-            }
-            in2.close();
-
-            var id = new BigDecimal(mapper.readTree(response2.toString()).get("id").asText());
-
-            var authenticated = webConnection.session().getBoolean("authenticated");
-
-            if (authenticated) {
-                var uid = PlayerDao.getByDiscordId(id);
-                if (uid > 0) {
-                    webConnection.session().set("alertMessage", "Your Discord account is already linked to another user\n");
-                    webConnection.redirect("/");
-                    return;
-                }
-                else
-                {
-                    uid = webConnection.session().getInt("user.id");
-                    PlayerDao.setDiscordId(uid, id);
-                    webConnection.session().set("discord.saved.alert", true);
-                    webConnection.redirect("/");
-                    RconUtil.sendCommand(RconHeader.REFRESH_TRADE_SETTING, new HashMap<>());
-                    return;
-                }
-            }
-            else {
-                if (SessionUtil.login(webConnection, id, true)) {
-                    webConnection.redirect("/security_check");
-                }
-                else {
-                    webConnection.redirect("/");
-                }
-                return;
-            }
         } catch (Exception e) {
             webConnection.session().set("alertMessage", "Something went wrong\n");
             webConnection.redirect("/");
-            return;
         }
+    }
+
+    // ---------------------------------------------------------
+    // Troca o code pelo access_token
+    // ---------------------------------------------------------
+    private static String fetchAccessToken(String code) throws Exception {
+        var clientId     = GameConfiguration.getInstance().getString("discord.client_id");
+        var clientSecret = GameConfiguration.getInstance().getString("discord.client_secret");
+        var redirectUri  = GameConfiguration.getInstance().getString("site.path") + "/api/discord";
+
+        var body =
+            "client_id="     + URLEncoder.encode(clientId,               "UTF-8") + "&" +
+            "client_secret=" + URLEncoder.encode(clientSecret,           "UTF-8") + "&" +
+            "grant_type="    + URLEncoder.encode("authorization_code",   "UTF-8") + "&" +
+            "code="          + URLEncoder.encode(code,                   "UTF-8") + "&" +
+            "redirect_uri="  + URLEncoder.encode(redirectUri,            "UTF-8") + "&" +
+            "scope="         + URLEncoder.encode("identify",             "UTF-8");
+
+        var response = post(TOKEN_URL, body);
+        return new ObjectMapper().readTree(response).get("access_token").asText();
+    }
+
+    // ---------------------------------------------------------
+    // Busca o ID do usuário Discord com o token
+    // ---------------------------------------------------------
+    private static BigDecimal fetchDiscordId(String accessToken) throws Exception {
+        var connection = (HttpURLConnection) new URL(USER_URL).openConnection();
+        connection.setRequestProperty("Authorization", "Bearer " + accessToken);
+
+        if (connection.getResponseCode() != 200) {
+            throw new Exception("Discord user fetch failed: " + connection.getResponseCode());
+        }
+
+        var response = readResponse(connection);
+        return new BigDecimal(new ObjectMapper().readTree(response).get("id").asText());
+    }
+
+    // ---------------------------------------------------------
+    // Decide o fluxo: vincular conta ou fazer login
+    // ---------------------------------------------------------
+    private static void handleVerification(WebConnection webConnection, BigDecimal discordId) throws Exception {
+        if (webConnection.session().getBoolean("authenticated")) {
+            linkDiscordAccount(webConnection, discordId);
+        } else {
+            loginWithDiscord(webConnection, discordId);
+        }
+    }
+
+    private static void linkDiscordAccount(WebConnection webConnection, BigDecimal discordId) {
+        var existingUid = PlayerDao.getByDiscordId(discordId);
+
+        if (existingUid > 0) {
+            webConnection.session().set("alertMessage", "Your Discord account is already linked to another user\n");
+        } else {
+            var uid = webConnection.session().getInt("user.id");
+            PlayerDao.setDiscordId(uid, discordId);
+            webConnection.session().set("discord.saved.alert", true);
+            RconUtil.sendCommand(RconHeader.REFRESH_TRADE_SETTING, new HashMap<>());
+        }
+
+        webConnection.redirect("/");
+    }
+
+    private static void loginWithDiscord(WebConnection webConnection, BigDecimal discordId) {
+        var destination = SessionUtil.login(webConnection, discordId, true)
+            ? "/security_check"
+            : "/";
+
+        webConnection.redirect(destination);
+    }
+
+    // ---------------------------------------------------------
+    // Helpers HTTP genéricos
+    // ---------------------------------------------------------
+    private static String post(String targetUrl, String body) throws Exception {
+        var connection = (HttpURLConnection) new URL(targetUrl).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        connection.setRequestProperty("Content-Length", Integer.toString(body.length()));
+        connection.setDoOutput(true);
+
+        try (var out = new DataOutputStream(connection.getOutputStream())) {
+            out.writeBytes(body);
+        }
+
+        if (connection.getResponseCode() != 200) {
+            throw new Exception("HTTP POST failed: " + connection.getResponseCode());
+        }
+
+        return readResponse(connection);
+    }
+
+    private static String readResponse(HttpURLConnection connection) throws Exception {
+        var sb = new StringBuilder();
+
+        try (var reader = new BufferedReader(new InputStreamReader(connection.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+        }
+
+        return sb.toString();
     }
 }
